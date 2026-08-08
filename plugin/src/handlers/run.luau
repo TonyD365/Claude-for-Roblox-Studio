@@ -50,7 +50,10 @@ end
 
 function M.start_test(args: any)
 	local agentInjected = injectAgent(args and args.agent)
-	RunService:Run()
+	-- RunService:Run() 会阻塞，所以需要在独立线程里执行，避免阻塞 WebSocket 消息处理。
+	task.spawn(function()
+		RunService:Run()
+	end)
 	task.wait() -- 让运行状态切换落定一帧，再读回真实状态。
 	local s = state()
 	local res: { [string]: any } = {
