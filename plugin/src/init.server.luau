@@ -296,6 +296,17 @@ startConnection = function()
 
 	generation += 1
 	local gen = generation
+
+	-- 重连前先关掉上一条连接：Studio 进入 Test 时经常直接丢弃 WebSocket 而不发关闭帧，
+	-- 桥那边会以为它还开着；两条连接同时挂在同一个通道上会把桌面 App 卡死。
+	if client then
+		local stale = client
+		client = nil
+		pcall(function()
+			stale:Close()
+		end)
+	end
+
 	setStatus("Connecting (WebSocket)…")
 
 	local ok, c = pcall(function()
@@ -346,6 +357,7 @@ startConnection = function()
 
 	c.Closed:Connect(function()
 		if gen ~= generation then
+			-- 已被新连接取代的旧 socket：不要把当前 client 置空。
 			return
 		end
 		client = nil
