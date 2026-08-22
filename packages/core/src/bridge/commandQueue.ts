@@ -67,6 +67,14 @@ export class CommandQueue {
   private waiter: { resolve: (env: CommandEnvelope | null) => void; timer: ReturnType<typeof setTimeout> } | null = null;
   private lastPollAt = 0;
   private connectedSessionId: string | null = null;
+  /** 连接序号自增器。 */
+  private connSeq = 0;
+  /**
+   * 当前唯一活动连接的 id（0 = 无连接）。
+   * 队列一次只服务一条 WS 连接：Studio 进入 Test 时旧连接常常没发关闭帧就被丢弃，
+   * 若新旧两条连接同时跑 poll 循环，两边会互相唤醒对方的 waiter，形成微任务活锁把事件循环饿死。
+   */
+  private activeConn = 0;
   /** 插件 handshake 上报的工具集（用于检测版本不一致）；null 表示未知（旧插件）。 */
   private pluginTools: Set<string> | null = null;
   /** 命令日志（最近 LOG_MAX 条）。 */
@@ -92,6 +100,32 @@ export class CommandQueue {
     }
   }
 
+  /** 唤醒当前停泊的 waiter（以 null 结束它的 poll），让对应的推送循环有机会退出。 */
+  private wakeWaiter(): void {
+    if (!this.waiter) return;
+    clearTimeout(this.waiter.timer);
+    const resolve = this.waiter.resolve;
+    this.waiter = null;
+    resolve(null);
+  }
+
+  /**
+   * WS 握手后调用：本连接成为该通道唯一的活动连接，旧连接就此作废。
+   * 返回的 id 要回传给 poll()/markDisconnected()，并用 isCurrentConnection() 作为推送循环的存活条件。
+   */
+  attachConnection(): number {
+    this.connSeq += 1;
+    this.activeConn = this.connSeq;
+    // 旧连接可能还停着 waiter，唤醒它让旧推送循环立刻退出。
+    this.wakeWaiter();
+    return this.activeConn;
+  }
+
+  /** 该连接是否仍是活动连接（被新连接顶掉后返回 false）。 */
+  isCurrentConnection(connId: number): boolean {
+    return connId === this.activeConn;
+  }
+
   /** 由 handshake 调用，标记某个插件会话已配对成功。 */
   setConnectedSession(sessionId: string): void {
     this.connectedSessionId = sessionId;
@@ -99,19 +133,21 @@ export class CommandQueue {
     this.needsReconnect = false;
   }
 
-  /** WS 连接关闭时调用：明确标记断开（不必等心跳超时）。 */
-  markDisconnected(): void {
+  /**
+   * WS 连接关闭时调用：明确标记断开（不必等心跳超时）。
+   * 传入 connId 时，过期连接（已被新连接顶掉）的关闭事件会被忽略——
+   * 否则重连后姗姗来迟的旧 close 会把刚建好的连接判成离线。
+   */
+  markDisconnected(connId?: number): void {
+    if (connId !== undefined && connId !== this.activeConn) return;
+    this.activeConn = 0;
     this.connectedSessionId = null;
     this.lastPollAt = 0;
     this.pluginTools = null;
     this.needsReconnect = false;
     this.rejectAll(new Error("Studio plugin disconnected"));
     // 唤醒停泊的 waiter，让 WS 推送循环及时退出。
-    if (this.waiter) {
-      clearTimeout(this.waiter.timer);
-      this.waiter.resolve(null);
-      this.waiter = null;
-    }
+    this.wakeWaiter();
   }
 
   /** 记录插件上报的工具集；不传则视为未知（旧插件，跳过预检）。 */
@@ -219,16 +255,21 @@ export class CommandQueue {
    * 插件长轮询：返回下一条命令；若 pollTimeoutMs 内无命令返回 null。
    * 调用即视为一次心跳。
    */
-  poll(sessionId: string): Promise<CommandEnvelope | null> {
+  poll(sessionId: string, connId?: number): Promise<CommandEnvelope | null> {
+    // 过期连接：不派命令、不刷心跳、也不停泊 waiter，只在超时后返回 null。
+    // 这样即使调用方忘了检查 isCurrentConnection，也只是慢慢空转而不会烧掉事件循环。
+    if (connId !== undefined && connId !== this.activeConn) {
+      return new Promise<CommandEnvelope | null>((resolve) => {
+        const timer = setTimeout(() => resolve(null), this.pollTimeoutMs);
+        timer.unref?.();
+      });
+    }
+
     this.lastPollAt = Date.now();
     if (this.connectedSessionId === null) this.connectedSessionId = sessionId;
 
     // 没有命令：停泊一个 waiter（仅保留最新的一个）。
-    if (this.waiter) {
-      clearTimeout(this.waiter.timer);
-      this.waiter.resolve(null);
-      this.waiter = null;
-    }
+    this.wakeWaiter();
     return new Promise<CommandEnvelope | null>((resolve) => {
       const timer = setTimeout(() => {
         if (this.waiter && this.waiter.resolve === resolve) this.waiter = null;
@@ -262,12 +303,9 @@ export class CommandQueue {
 
   /** 关停：拒绝所有等待中的命令并清理。 */
   shutdown(): void {
-    if (this.waiter) {
-      clearTimeout(this.waiter.timer);
-      this.waiter.resolve(null);
-      this.waiter = null;
-    }
+    this.wakeWaiter();
     this.rejectAll(new Error("Server shutting down"));
+    this.activeConn = 0;
     this.connectedSessionId = null;
     this.pluginTools = null;
   }

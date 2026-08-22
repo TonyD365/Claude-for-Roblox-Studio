@@ -35,11 +35,23 @@ export interface BridgeServerOptions {
 }
 
 const HOST = "127.0.0.1";
+/** WS 保活 ping 间隔。 */
+const HEARTBEAT_MS = 30_000;
+/**
+ * 连续这么多次没回 pong 才掐断（约 90s）。
+ * 留足余量：插件执行长命令（run_luau 默认 30s）期间不能被误判成死连接。
+ */
+const MAX_MISSED_PONGS = 3;
 
 export class BridgeServer {
   private server: Server | null = null;
   private wss: WebSocketServer | null = null;
   private mcpTransports = new Map<string, StreamableHTTPServerTransport>();
+  /** 每个通道当前的活动 socket（plugin / agent 各一条），新连接会顶掉旧的。 */
+  private activeSockets = new Map<string, WebSocket>();
+  /** 保活：每条 socket 连续未回 pong 的次数。 */
+  private missedPongs = new WeakMap<WebSocket, number>();
+  private heartbeat: ReturnType<typeof setInterval> | null = null;
   private lastMcpAt = 0;
   private mcpClient: { name: string; version?: string } | null = null;
 
@@ -70,10 +82,17 @@ export class BridgeServer {
       server.on("error", reject);
       server.listen(this.opts.port, HOST, () => resolve());
       this.server = server;
+      this.heartbeat = setInterval(() => this.sweepDeadSockets(), HEARTBEAT_MS);
+      this.heartbeat.unref?.();
     });
   }
 
   async stop(): Promise<void> {
+    if (this.heartbeat) {
+      clearInterval(this.heartbeat);
+      this.heartbeat = null;
+    }
+    this.activeSockets.clear();
     for (const t of this.mcpTransports.values()) {
       try {
         await t.close();
@@ -100,6 +119,32 @@ export class BridgeServer {
     this.server = null;
   }
 
+  /**
+   * ping 所有 WS 客户端，掐掉连续 MAX_MISSED_PONGS 轮没回 pong 的。
+   * Studio 进入 Test 时经常直接丢弃 socket 而不发关闭帧，服务端会一直以为它还开着；
+   * 没有保活的话这些半开连接会永远占着通道。
+   */
+  private sweepDeadSockets(): void {
+    if (!this.wss) return;
+    for (const ws of this.wss.clients) {
+      const missed = (this.missedPongs.get(ws) ?? 0) + 1;
+      if (missed > MAX_MISSED_PONGS) {
+        try {
+          ws.terminate();
+        } catch {
+          // ignore
+        }
+        continue;
+      }
+      this.missedPongs.set(ws, missed);
+      try {
+        ws.ping();
+      } catch {
+        // ignore
+      }
+    }
+  }
+
   // ---- WebSocket 升级（插件 / agent 通道） ----
   private handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
     const url = new URL(req.url ?? "/", `http://${HOST}:${this.opts.port}`);
@@ -118,18 +163,23 @@ export class BridgeServer {
 
   private handleWs(ws: WebSocket, url: URL): void {
     const isAgent = url.searchParams.get("role") === "agent";
+    const channel = isAgent ? "agent" : "plugin";
     const queue = isAgent ? this.opts.agentQueue : this.opts.queue;
-    let pumping = false;
+    /** 本连接在队列里的归属 id；0 = 还没握手。 */
+    let connId = 0;
     let sid: string = randomUUID();
 
+    this.missedPongs.set(ws, 0);
+    ws.on("pong", () => this.missedPongs.set(ws, 0));
+
     // 推送循环：把队列里的命令通过 WS 即时发给插件。
-    const pump = async () => {
-      if (pumping) return;
-      pumping = true;
+    // 循环条件里必须带 isCurrentConnection：被新连接顶掉后要立刻退出，
+    // 否则新旧两个循环会互相唤醒对方的 poll waiter，把事件循环彻底饿死。
+    const pump = async (myConn: number) => {
       try {
-        while (ws.readyState === WebSocket.OPEN) {
-          const env = await queue.poll(sid);
-          if (env && ws.readyState === WebSocket.OPEN) {
+        while (ws.readyState === WebSocket.OPEN && queue.isCurrentConnection(myConn)) {
+          const env = await queue.poll(sid, myConn);
+          if (env && ws.readyState === WebSocket.OPEN && queue.isCurrentConnection(myConn)) {
             ws.send(JSON.stringify({ type: "command", payload: env }));
           }
         }
@@ -149,6 +199,21 @@ export class BridgeServer {
 
       if (msg.type === "handshake") {
         if (typeof msg.sessionId === "string" && msg.sessionId) sid = msg.sessionId;
+
+        // 同一通道只保留最新一条连接：把上一条掐掉。
+        // 用户在 Studio 点 Test 时，Studio 会丢掉旧 WebSocket 并让插件重连，
+        // 而旧连接往往没发关闭帧，服务端还以为它开着。
+        const previous = this.activeSockets.get(channel);
+        if (previous && previous !== ws) {
+          try {
+            previous.terminate();
+          } catch {
+            // ignore
+          }
+        }
+        this.activeSockets.set(channel, ws);
+
+        connId = queue.attachConnection();
         queue.setConnectedSession(sid);
         if (isAgent) {
           this.opts.events.publish({ type: "agentState", state: "online" });
@@ -159,7 +224,7 @@ export class BridgeServer {
         ws.send(
           JSON.stringify({ type: "handshake_ok", protocol: PROTOCOL_VERSION, serverVersion: SERVER_VERSION }),
         );
-        void pump();
+        void pump(connId);
       } else if (msg.type === "response") {
         // id 可能属于任一通道，两边都试一下。
         const r = msg as unknown as ResponseEnvelope;
@@ -171,7 +236,10 @@ export class BridgeServer {
     });
 
     ws.on("close", () => {
-      queue.markDisconnected();
+      // 已经被新连接顶掉的旧 socket：它的 close 迟到，不能把新连接判成离线。
+      if (this.activeSockets.get(channel) === ws) this.activeSockets.delete(channel);
+      if (connId === 0 || !queue.isCurrentConnection(connId)) return;
+      queue.markDisconnected(connId);
       if (isAgent) this.opts.events.publish({ type: "agentState", state: "offline" });
     });
     ws.on("error", () => {
